@@ -34,23 +34,32 @@ static int set_nonblocking(int fd) {
 static void reap_if_finished(int idx) {
     if (idx < 0 || idx >= MAX_PROCS) return;
 
+    // Fast check: if we already have a final code, don't call waitpid again.
     pthread_mutex_lock(&procs_mutex);
-    if (!procs[idx].used) { pthread_mutex_unlock(&procs_mutex); return; }
+    if (!procs[idx].used || procs[idx].exit_code != -2) {
+        pthread_mutex_unlock(&procs_mutex);
+        return;
+    }
     pid_t pid = procs[idx].pid;
     pthread_mutex_unlock(&procs_mutex);
 
     int status = 0;
     pid_t r = waitpid(pid, &status, WNOHANG);
-    if (r == 0) return; // still running
 
     pthread_mutex_lock(&procs_mutex);
+    // Another thread might have set exit_code while we were in waitpid.
+    if (!procs[idx].used || procs[idx].exit_code != -2) {
+        pthread_mutex_unlock(&procs_mutex);
+        return;
+    }
+
     if (r == pid) {
         if (WIFEXITED(status))       procs[idx].exit_code = WEXITSTATUS(status);
         else if (WIFSIGNALED(status)) procs[idx].exit_code = 128 + WTERMSIG(status);
         else                          procs[idx].exit_code = -1;
-        // leave fds open for reader to drain
-    } else {
-        if (r == -1) procs[idx].exit_code = -1;
+    } else if (r == -1) {
+        // Only mark -1 if we truly haven't recorded anything yet.
+        procs[idx].exit_code = -1;
     }
     pthread_mutex_unlock(&procs_mutex);
 }
