@@ -241,4 +241,3 @@ int stop_process(int handle) {
     reap_if_finished(handle);
     return 0;
 }
-

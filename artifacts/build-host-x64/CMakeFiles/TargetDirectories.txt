@@ -1,0 +1,3 @@
+/home/mahadeva/code/ProcWrapper/artifacts/build-host-x64/CMakeFiles/procwrapper.dir
+/home/mahadeva/code/ProcWrapper/artifacts/build-host-x64/CMakeFiles/edit_cache.dir
+/home/mahadeva/code/ProcWrapper/artifacts/build-host-x64/CMakeFiles/rebuild_cache.dir

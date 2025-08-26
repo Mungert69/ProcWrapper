@@ -1,3 +1,6 @@
 {
-    "cmake.sourceDirectory": "/home/mahadeva/code/ProcWrapper/native"
+    "cmake.sourceDirectory": "/home/mahadeva/code/ProcWrapper/native",
+    "files.associations": {
+        "pthread.h": "c"
+    }
 }

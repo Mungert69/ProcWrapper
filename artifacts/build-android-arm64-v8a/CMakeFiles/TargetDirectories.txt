@@ -1,0 +1,3 @@
+/home/mahadeva/code/ProcWrapper/artifacts/build-android-arm64-v8a/CMakeFiles/procwrapper.dir
+/home/mahadeva/code/ProcWrapper/artifacts/build-android-arm64-v8a/CMakeFiles/edit_cache.dir
+/home/mahadeva/code/ProcWrapper/artifacts/build-android-arm64-v8a/CMakeFiles/rebuild_cache.dir
