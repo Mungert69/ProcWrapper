@@ -1,1 +1,0 @@
-/usr/bin/cc -fPIC -O3 -DNDEBUG -shared -Wl,-soname,libprocwrapper.so -o /home/mahadeva/code/ProcWrapper/artifacts/install-host-x64/libprocwrapper.so CMakeFiles/procwrapper.dir/procwrapper.c.o 

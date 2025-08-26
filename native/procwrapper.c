@@ -12,11 +12,11 @@
 #include <signal.h>
 
 typedef struct {
-    int used;
+    int   used;
     pid_t pid;
-    int stdout_fd;
-    int stderr_fd;
-    int exit_code; // -2 = not set yet (running), >=0 real exit code, -1 = unknown/error
+    int   stdout_fd;
+    int   stderr_fd;
+    int   exit_code; // -2 = running/not set, >=0 real exit code, -1 = error
 } proc_entry;
 
 #define MAX_PROCS 64
@@ -29,9 +29,11 @@ static int set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-// helper: reap child if finished; called by is_running/get_exit_code
+// Reap child if finished; ONLY set exit_code here.
+// Do NOT close fds or clear 'used' so readers can drain and observe EOF.
 static void reap_if_finished(int idx) {
     if (idx < 0 || idx >= MAX_PROCS) return;
+
     pthread_mutex_lock(&procs_mutex);
     if (!procs[idx].used) { pthread_mutex_unlock(&procs_mutex); return; }
     pid_t pid = procs[idx].pid;
@@ -39,24 +41,17 @@ static void reap_if_finished(int idx) {
 
     int status = 0;
     pid_t r = waitpid(pid, &status, WNOHANG);
-    if (r == 0) {
-        // still running
-        return;
-    }
-    // child exited or error
+    if (r == 0) return; // still running
+
     pthread_mutex_lock(&procs_mutex);
     if (r == pid) {
-        if (WIFEXITED(status)) procs[idx].exit_code = WEXITSTATUS(status);
-        else if (WIFSIGNALED(status)) procs[idx].exit_code = 128 + WTERMSIG(status); // encode signal
-        else procs[idx].exit_code = -1;
+        if (WIFEXITED(status))       procs[idx].exit_code = WEXITSTATUS(status);
+        else if (WIFSIGNALED(status)) procs[idx].exit_code = 128 + WTERMSIG(status);
+        else                          procs[idx].exit_code = -1;
+        // leave fds open for reader to drain
     } else {
-        // waitpid returned -1 or other child; treat as error
         if (r == -1) procs[idx].exit_code = -1;
     }
-    // close pipes and mark available
-    if (procs[idx].stdout_fd >= 0) { close(procs[idx].stdout_fd); procs[idx].stdout_fd = -1; }
-    if (procs[idx].stderr_fd >= 0) { close(procs[idx].stderr_fd); procs[idx].stderr_fd = -1; }
-    procs[idx].used = 0;
     pthread_mutex_unlock(&procs_mutex);
 }
 
@@ -87,21 +82,21 @@ int start_process(const char* path, char* const argv[]) {
 
     if (pid == 0) {
         // child
-        // set default signal handlers for safety
-        signal(SIGINT, SIG_DFL);
+        signal(SIGINT,  SIG_DFL);
         signal(SIGTERM, SIG_DFL);
 
         close(outpipe[0]);
         close(errpipe[0]);
         dup2(outpipe[1], STDOUT_FILENO);
         dup2(errpipe[1], STDERR_FILENO);
-        // close the write ends after dup
         close(outpipe[1]);
         close(errpipe[1]);
 
         // execv - use provided argv
         execv(path, argv);
-        // if execv fails
+        // if execv fails: report reason then exit 127
+        int e = errno;
+        dprintf(STDERR_FILENO, "execv failed: %s (%d) path=%s\n", strerror(e), e, path);
         _exit(127);
     }
 
@@ -113,29 +108,47 @@ int start_process(const char* path, char* const argv[]) {
     set_nonblocking(errpipe[0]);
 
     pthread_mutex_lock(&procs_mutex);
-    procs[idx].used = 1;
-    procs[idx].pid = pid;
+    procs[idx].used      = 1;
+    procs[idx].pid       = pid;
     procs[idx].stdout_fd = outpipe[0];
     procs[idx].stderr_fd = errpipe[0];
-    procs[idx].exit_code = -2; // indicates "running/not set"
+    procs[idx].exit_code = -2; // running
     pthread_mutex_unlock(&procs_mutex);
 
     return idx;
+}
+
+static void maybe_clear_slot_after_eof(int handle) {
+    // Called with mutex locked by caller
+    if (handle < 0 || handle >= MAX_PROCS) return;
+    if (!procs[handle].used) return;
+    if (procs[handle].stdout_fd < 0 && procs[handle].stderr_fd < 0 && procs[handle].exit_code >= 0) {
+        procs[handle].used = 0;
+    }
 }
 
 __attribute__((visibility("default")))
 int read_stdout(int handle, char* buffer, int buflen) {
     if (!buffer || buflen <= 0) return -1;
     if (handle < 0 || handle >= MAX_PROCS) return -1;
+
     pthread_mutex_lock(&procs_mutex);
-    if (!procs[handle].used && procs[handle].exit_code == -2) { // shouldn't happen but guard
-        pthread_mutex_unlock(&procs_mutex);
-        return -1;
-    }
     int fd = procs[handle].stdout_fd;
     pthread_mutex_unlock(&procs_mutex);
     if (fd < 0) return 0;
+
     ssize_t n = read(fd, buffer, buflen);
+    if (n == 0) {
+        // EOF: close and possibly free slot
+        pthread_mutex_lock(&procs_mutex);
+        if (procs[handle].stdout_fd >= 0) {
+            close(procs[handle].stdout_fd);
+            procs[handle].stdout_fd = -1;
+            maybe_clear_slot_after_eof(handle);
+        }
+        pthread_mutex_unlock(&procs_mutex);
+        return 0;
+    }
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
         return -1;
@@ -147,11 +160,24 @@ __attribute__((visibility("default")))
 int read_stderr(int handle, char* buffer, int buflen) {
     if (!buffer || buflen <= 0) return -1;
     if (handle < 0 || handle >= MAX_PROCS) return -1;
+
     pthread_mutex_lock(&procs_mutex);
     int fd = procs[handle].stderr_fd;
     pthread_mutex_unlock(&procs_mutex);
     if (fd < 0) return 0;
+
     ssize_t n = read(fd, buffer, buflen);
+    if (n == 0) {
+        // EOF: close and possibly free slot
+        pthread_mutex_lock(&procs_mutex);
+        if (procs[handle].stderr_fd >= 0) {
+            close(procs[handle].stderr_fd);
+            procs[handle].stderr_fd = -1;
+            maybe_clear_slot_after_eof(handle);
+        }
+        pthread_mutex_unlock(&procs_mutex);
+        return 0;
+    }
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
         return -1;
@@ -185,21 +211,17 @@ int get_exit_code(int handle) {
 __attribute__((visibility("default")))
 int stop_process(int handle) {
     if (handle < 0 || handle >= MAX_PROCS) return -1;
+
     pthread_mutex_lock(&procs_mutex);
     if (!procs[handle].used && procs[handle].exit_code != -2) {
-        // already not running
         pthread_mutex_unlock(&procs_mutex);
-        return 0;
+        return 0; // already not running
     }
     pid_t pid = procs[handle].pid;
     pthread_mutex_unlock(&procs_mutex);
 
     if (kill(pid, SIGTERM) == -1) {
-        if (errno == ESRCH) {
-            // no such process
-            return 0;
-        }
-        // other error
+        if (errno == ESRCH) return 0; // no such process
     }
 
     // small wait for graceful shutdown
@@ -214,7 +236,9 @@ int stop_process(int handle) {
         kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
     }
-    // ensure we reap and close fds
-    for (int i = 0; i < MAX_PROCS; ++i) reap_if_finished(i);
+
+    // mark exit code if we can reap here too
+    reap_if_finished(handle);
     return 0;
 }
+
